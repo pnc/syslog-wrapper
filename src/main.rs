@@ -2,8 +2,11 @@ use std::process::Command;
 use std::process::Stdio;
 use std::io::BufReader;
 use std::io::BufRead;
+use std::io::Write;
 use std::thread;
 use std::sync::mpsc::channel;
+
+extern crate rustls;
 
 #[derive(Debug)]
 enum DeliverValue {
@@ -51,12 +54,40 @@ fn main() {
 
 
     let delivery = thread::spawn(move || {
+        let mut socket = std::net::TcpStream::connect("localhost:8443").unwrap();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add_server_trust_anchors(
+            webpki_roots::TLS_SERVER_ROOTS
+                .0
+                .iter()
+                .map(|ta| {
+                    rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                        ta.subject,
+                        ta.spki,
+                        ta.name_constraints,
+                    )
+                })
+        );
+
+        let config = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let arc = std::sync::Arc::new(config);
+        //let dns_name = webpki::DnsNameRef::try_from_ascii_str("localhost").unwrap();
+        let example_com = "localhost".try_into().unwrap();
+        let mut client = rustls::ClientConnection::new(arc, example_com).unwrap();
+        let mut stream = rustls::Stream::new(&mut client, &mut socket); // Create stream
+                                                                        // Instead of writing to the client, you write to the stream
+
         loop {
             let result1 = receiver.recv().unwrap();
             match result1 {
                 DeliverValue::Eof() => break,
-                DeliverValue::Line(str) => println!("deliver: {str}")
-            }
+                DeliverValue::Line(str) => stream.write(str.as_bytes()).unwrap()
+            };
         }
     });
 
