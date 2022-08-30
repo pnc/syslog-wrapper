@@ -3,8 +3,26 @@ use std::process::Stdio;
 use std::io::BufReader;
 use std::io::BufRead;
 use std::io::Write;
+use std::process::exit;
 use std::thread;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::sync_channel;
+use std::fs::File;
+
+use rustls::Certificate;
+
+// Consider: https://docs.rs/binary-layout/latest/binary_layout/
+
+// https://docs.rs/clap/latest/clap/_derive/_cookbook/escaped_positional/index.html
+/*
+Test suite items:
+1. Overly long line
+2. Produce only stderr and exit, no stdout
+3. Preserve exit code
+4. Tarpit destination (accept connection but then block writes)
+5. Total throughput benchmark
+6. Invalid cert test
+7. Connection interrupted, reconnect without loss
+*/
 
 extern crate rustls;
 
@@ -15,14 +33,14 @@ enum DeliverValue {
 }
 
 fn main() {
-    let echo_hello = Command::new("./test.sh")
+    let mut echo_hello = Command::new("./test.sh")
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
         .spawn().unwrap();
-    let mut stdout_reader = BufReader::new(echo_hello.stdout.unwrap());
-    let mut stderr_reader = BufReader::new(echo_hello.stderr.unwrap());
+    let mut stdout_reader = BufReader::new(echo_hello.stdout.take().unwrap());
+    let mut stderr_reader = BufReader::new(echo_hello.stderr.take().unwrap());
 
-    let (sender, receiver) = channel();
+    let (sender, receiver) = sync_channel(2);
 
     let stdout_sender = sender.clone();
     let stdout_handler = thread::spawn(move || {
@@ -34,7 +52,7 @@ fn main() {
                 break
             }
             println!("stdout line is {len} bytes long");
-            stdout_sender.send(DeliverValue::Line(line)).expect("receiver hung up :(");
+            stdout_sender.try_send(DeliverValue::Line(line)).expect("receiver hung up :(");
         }
     });
 
@@ -48,7 +66,7 @@ fn main() {
                 break
             }
             println!("stderr line is {len} bytes long");
-            stderr_sender.send(DeliverValue::Line(line)).expect("receiver hung up :(");
+            stderr_sender.try_send(DeliverValue::Line(line)).expect("receiver hung up :(");
         }
     });
 
@@ -57,6 +75,15 @@ fn main() {
         let mut socket = std::net::TcpStream::connect("localhost:8443").unwrap();
 
         let mut root_store = rustls::RootCertStore::empty();
+
+        let cert_file = File::open("server.pem").expect("Could not open server.pem");
+        let mut cert_file_reader = std::io::BufReader::new(cert_file);
+        let custom_cert = match rustls_pemfile::read_one(&mut cert_file_reader) {
+            Ok(Some(rustls_pemfile::Item::X509Certificate(cert_data))) => cert_data,
+            _ => panic!("could not parse")
+        };
+
+        root_store.add(&Certificate(custom_cert)).expect("could not add trust");
         root_store.add_server_trust_anchors(
             webpki_roots::TLS_SERVER_ROOTS
                 .0
@@ -95,4 +122,18 @@ fn main() {
     stdout_handler.join().unwrap();
     sender.send(DeliverValue::Eof()).expect("oh no");
     delivery.join().unwrap();
+    match echo_hello.wait() {
+        Ok(status) => match status.code() {
+            Some(status) => exit(status),
+            None => {
+                eprintln!("The subcommand did not return an exit code.");
+                exit(40);
+            }
+        },
+        Err(error) => {
+            eprintln!("An error occurred running the subcommand: {error}");
+            exit(40);
+        }
+
+    }
 }
