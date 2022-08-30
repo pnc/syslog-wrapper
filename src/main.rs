@@ -1,18 +1,22 @@
-use std::process::Command;
-use std::process::Stdio;
-use std::io::BufReader;
+use std::ffi::OsString;
+use std::fs::File;
 use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Write;
 use std::process::exit;
-use std::thread;
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::mpsc::sync_channel;
-use std::fs::File;
+use std::thread;
 
+use clap::Parser;
 use rustls::Certificate;
 
 // Consider: https://docs.rs/binary-layout/latest/binary_layout/
 
 // https://docs.rs/clap/latest/clap/_derive/_cookbook/escaped_positional/index.html
+// https://docs.rs/retry/latest/retry/
+// Do we actually need `cargo` feature?
 /*
 Test suite items:
 1. Overly long line
@@ -24,7 +28,20 @@ Test suite items:
 7. Connection interrupted, reconnect without loss
 */
 
-extern crate rustls;
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    /// Name of the person to greet
+    #[clap(short, long, value_parser, default_value = "adsf")]
+    name: String,
+
+    /// Number of times to greet
+    #[clap(short, long, value_parser, default_value_t = 1)]
+    count: u8,
+
+    #[clap(last = true, value_parser, required = true)]
+    command: Vec<OsString>,
+}
 
 #[derive(Debug)]
 enum DeliverValue {
@@ -33,43 +50,44 @@ enum DeliverValue {
 }
 
 fn main() {
-    let mut echo_hello = Command::new("./test.sh")
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-        .spawn().unwrap();
+    let args = Args::parse();
+
+    let mut echo_hello = Command::new(args.command[0].clone())
+        .args(&args.command[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let mut stdout_reader = BufReader::new(echo_hello.stdout.take().unwrap());
     let mut stderr_reader = BufReader::new(echo_hello.stderr.take().unwrap());
 
-    let (sender, receiver) = sync_channel(2);
+    let (sender, receiver) = sync_channel(200);
 
     let stdout_sender = sender.clone();
-    let stdout_handler = thread::spawn(move || {
-
-        loop {
-            let mut line = String::new();
-            let len = stdout_reader.read_line(&mut line).expect("please be cool");
-            if len == 0 {
-                break
-            }
-            println!("stdout line is {len} bytes long");
-            stdout_sender.try_send(DeliverValue::Line(line)).expect("receiver hung up :(");
+    let stdout_handler = thread::spawn(move || loop {
+        let mut line = String::new();
+        let len = stdout_reader.read_line(&mut line).expect("please be cool");
+        if len == 0 {
+            break;
         }
+        println!("stdout line is {len} bytes long");
+        stdout_sender
+            .try_send(DeliverValue::Line(line))
+            .expect("receiver hung up :(");
     });
 
     let stderr_sender = sender.clone();
-    let stderr_handler = thread::spawn(move || {
-
-        loop {
-            let mut line = String::new();
-            let len = stderr_reader.read_line(&mut line).expect("please be cool");
-            if len == 0 {
-                break
-            }
-            println!("stderr line is {len} bytes long");
-            stderr_sender.try_send(DeliverValue::Line(line)).expect("receiver hung up :(");
+    let stderr_handler = thread::spawn(move || loop {
+        let mut line = String::new();
+        let len = stderr_reader.read_line(&mut line).expect("please be cool");
+        if len == 0 {
+            break;
         }
+        println!("stderr line is {len} bytes long");
+        stderr_sender
+            .try_send(DeliverValue::Line(line))
+            .expect("receiver hung up :(");
     });
-
 
     let delivery = thread::spawn(move || {
         let mut socket = std::net::TcpStream::connect("localhost:8443").unwrap();
@@ -80,22 +98,19 @@ fn main() {
         let mut cert_file_reader = std::io::BufReader::new(cert_file);
         let custom_cert = match rustls_pemfile::read_one(&mut cert_file_reader) {
             Ok(Some(rustls_pemfile::Item::X509Certificate(cert_data))) => cert_data,
-            _ => panic!("could not parse")
+            _ => panic!("could not parse"),
         };
 
-        root_store.add(&Certificate(custom_cert)).expect("could not add trust");
-        root_store.add_server_trust_anchors(
-            webpki_roots::TLS_SERVER_ROOTS
-                .0
-                .iter()
-                .map(|ta| {
-                    rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                        ta.subject,
-                        ta.spki,
-                        ta.name_constraints,
-                    )
-                })
-        );
+        root_store
+            .add(&Certificate(custom_cert))
+            .expect("could not add trust");
+        root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                ta.subject,
+                ta.spki,
+                ta.name_constraints,
+            )
+        }));
 
         let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
@@ -113,7 +128,7 @@ fn main() {
             let result1 = receiver.recv().unwrap();
             match result1 {
                 DeliverValue::Eof() => break,
-                DeliverValue::Line(str) => stream.write(str.as_bytes()).unwrap()
+                DeliverValue::Line(str) => stream.write(str.as_bytes()).unwrap(),
             };
         }
     });
@@ -134,6 +149,5 @@ fn main() {
             eprintln!("An error occurred running the subcommand: {error}");
             exit(40);
         }
-
     }
 }
