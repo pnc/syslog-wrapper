@@ -16,6 +16,10 @@ use rustls::Certificate;
 
 // https://docs.rs/clap/latest/clap/_derive/_cookbook/escaped_positional/index.html
 // https://docs.rs/retry/latest/retry/
+// https://www.rfc-editor.org/rfc/rfc3164#section-4.1
+// https://www.rfc-editor.org/rfc/rfc5425#section-4.3
+// https://www.rfc-editor.org/rfc/rfc5424#section-6
+// https://docs.rs/assert_cli/latest/assert_cli/
 // Do we actually need `cargo` feature?
 /*
 Test suite items:
@@ -35,10 +39,12 @@ struct Args {
     #[clap(short, long, value_parser, default_value = "adsf")]
     name: String,
 
-    /// Number of times to greet
-    #[clap(short, long, value_parser, default_value_t = 1)]
-    count: u8,
+    /// Maximum number of times to retry consecutively before crashing
+    #[clap(short, long, value_parser, default_value_t = 10)]
+    max_retries: u8,
 
+    /// The actual command to run, and the standard output and standard error
+    /// of which will be captured.
     #[clap(last = true, value_parser, required = true)]
     command: Vec<OsString>,
 }
@@ -52,14 +58,23 @@ enum DeliverValue {
 fn main() {
     let args = Args::parse();
 
-    let mut echo_hello = Command::new(args.command[0].clone())
+    let command_name = args.command[0].clone();
+    let spawn_result = Command::new(command_name.clone())
         .args(&args.command[1..])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdout_reader = BufReader::new(echo_hello.stdout.take().unwrap());
-    let mut stderr_reader = BufReader::new(echo_hello.stderr.take().unwrap());
+        .spawn();
+
+    let mut child_process = match spawn_result {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("An error occurred launching {command_name:?}: {error}");
+            exit(40);
+        },
+    };
+
+    let mut stdout_reader = BufReader::new(child_process.stdout.take().unwrap());
+    let mut stderr_reader = BufReader::new(child_process.stderr.take().unwrap());
 
     let (sender, receiver) = sync_channel(200);
 
@@ -137,8 +152,9 @@ fn main() {
     stdout_handler.join().unwrap();
     sender.send(DeliverValue::Eof()).expect("oh no");
     delivery.join().unwrap();
-    match echo_hello.wait() {
+    match child_process.wait() {
         Ok(status) => match status.code() {
+            // Preserve the exit code of the child
             Some(status) => exit(status),
             None => {
                 eprintln!("The subcommand did not return an exit code.");

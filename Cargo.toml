@@ -11,3 +11,6 @@ webpki-roots = "0.22.4"
 webpki = "0.22.0"
 rustls-pemfile = "1.0.1"
 clap = { version = "3.2.18", features = ["derive", "env", "cargo"] }
+
+[dev-dependencies]
+assert_cli = "0.6.3"
