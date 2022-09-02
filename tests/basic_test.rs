@@ -56,7 +56,33 @@ fn it_connects_and_sends_several_lines() {
       return Option::None;
     }
   }).collect();
-  assert_eq!(vec!["this is a special string"], output_lines);
+  assert_eq!(vec!["this should assert each line"], output_lines);
+}
+
+#[test]
+fn it_retries_on_socket_failures() {
+  // TODO: Make sure the errors go to actual stderr
+  assert!(false, "Pending test");
+}
+
+#[test]
+fn it_honors_hostname_flag() {
+  assert!(false, "Pending test");
+}
+
+#[test]
+fn it_honors_process_name_flag() {
+  assert!(false, "Pending test");
+}
+
+#[test]
+fn it_fails_if_certificate_is_not_trusted() {
+  assert!(false, "Pending test");
+}
+
+#[test]
+fn it_does_not_crash_on_super_long_lines() {
+  assert!(false, "Pending test");
 }
 
 fn spawn_test_server() -> (Child, String) {

@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::BufRead;
@@ -41,6 +42,14 @@ struct Args {
     #[clap(value_parser, env = "SYSLOG_SERVER")]
     server: String,
 
+    /// The hostname to report on the syslog messages. Defaults to the actual system hostname.
+    #[clap(value_parser, long, env = "SYSLOG_HOSTNAME")]
+    hostname: Option<String>,
+
+    /// The app-name/program name to report on the syslog messages. Defaults to `command`, excluding any arguments.
+    #[clap(value_parser, long, env = "SYSLOG_APPNAME")]
+    appname: Option<String>,
+
     /// Maximum number of times to retry consecutively before crashing
     #[clap(short, long, value_parser, default_value_t = 10)]
     max_retries: u8,
@@ -58,7 +67,17 @@ enum DeliverValue {
 }
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // TODO: Drop into builder mode so these don't have to be ugly Optionals.
+    // See https://docs.rs/clap/latest/clap/_derive/index.html#mixing-builder-and-derive-apis
+    if args.hostname.is_none() {
+        args.hostname = Some(gethostname::gethostname().to_string_lossy().to_string());
+    }
+
+    if args.appname.is_none() {
+        args.appname = Some(args.command[0].to_string_lossy().to_string());
+    }
 
     let (host, port): (String, u16) = match args.server.split_once(":") {
         Some((host, port_str)) => (host.into(), port_str.parse().unwrap()),
@@ -88,11 +107,12 @@ fn main() {
     let stdout_sender = sender.clone();
     let stdout_handler = thread::spawn(move || loop {
         let mut line = String::new();
-        let len = stdout_reader.read_line(&mut line).expect("please be cool");
+        let len = stdout_reader.read_line(&mut line).expect("error reading next line from subcommand's stdout");
         if len == 0 {
             break;
         }
-        println!("stdout line is {len} bytes long");
+        // TODO: Possibly have a pass-through/tee mode that also echoes?
+        // println!("stdout line is {len} bytes long");
         stdout_sender
             .try_send(DeliverValue::Line(line))
             .expect("receiver hung up :(");
@@ -101,11 +121,12 @@ fn main() {
     let stderr_sender = sender.clone();
     let stderr_handler = thread::spawn(move || loop {
         let mut line = String::new();
-        let len = stderr_reader.read_line(&mut line).expect("please be cool");
+        let len = stderr_reader.read_line(&mut line).expect("error reading next line from subcommand's stderr");
         if len == 0 {
             break;
         }
-        println!("stderr line is {len} bytes long");
+        // TODO: Possibly have a pass-through/tee mode that also echoes?
+        // eprintln!("stderr line is {len} bytes long");
         stderr_sender
             .try_send(DeliverValue::Line(line))
             .expect("receiver hung up :(");
@@ -118,17 +139,19 @@ fn main() {
         });
 
         let mut root_store = rustls::RootCertStore::empty();
+        // TODO: Put this behind a special --add-trusted-certificates flag
 
-        let cert_file = File::open("server.pem").expect("Could not open server.pem");
-        let mut cert_file_reader = std::io::BufReader::new(cert_file);
-        let custom_cert = match rustls_pemfile::read_one(&mut cert_file_reader) {
-            Ok(Some(rustls_pemfile::Item::X509Certificate(cert_data))) => cert_data,
-            _ => panic!("could not parse"),
-        };
+        // let cert_file = File::open("server.pem").expect("Could not open server.pem");
+        // let mut cert_file_reader = std::io::BufReader::new(cert_file);
+        // let custom_cert = match rustls_pemfile::read_one(&mut cert_file_reader) {
+        //     Ok(Some(rustls_pemfile::Item::X509Certificate(cert_data))) => cert_data,
+        //     _ => panic!("could not parse"),
+        // };
 
-        root_store
-            .add(&Certificate(custom_cert))
-            .expect("could not add trust");
+        // root_store
+        //     .add(&Certificate(custom_cert))
+        //     .expect("could not add trust");
+
         root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
             rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
                 ta.subject,
@@ -149,13 +172,16 @@ fn main() {
         let mut stream = rustls::Stream::new(&mut client, &mut socket); // Create stream
                                                                         // Instead of writing to the client, you write to the stream
 
+        let hostname = args.hostname.expect("The command line parser failed.");
+        let appname = args.appname.expect("The command line parser failed.");
         loop {
             let result1 = receiver.recv().unwrap();
             match result1 {
                 DeliverValue::Eof() => break,
                 DeliverValue::Line(str) => {
                     // TODO: Enforce newline?
-                    let formatted = format!("<165>1 2003-08-24T05:14:15.000003-07:00 192.0.2.1 myproc 8710 - - {str}");
+                    // TODO: What if appname contains space?
+                    let formatted = format!("<165>1 2003-08-24T05:14:15.000003-07:00 {hostname} {appname} 8710 - - {str}");
                     stream.write(formatted.as_bytes()).unwrap();
                 },
             };
