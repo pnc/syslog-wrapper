@@ -30,10 +30,11 @@ fn it_fails_to_connect() {
 
 #[test]
 fn it_preserves_exit_code() {
-  let (mut server, port_flag) = spawn_test_server();
+  let (mut server, test_flags) = spawn_test_server();
 
   Assert::main_binary()
-    .with_args(&[&*port_flag, "--", "sh", "-c", "exit 69"])
+    .with_args(&test_flags)
+    .with_args(&["--", "sh", "-c", "exit 69"])
       .fails_with(69).and().unwrap();
 
   server.kill().unwrap();
@@ -41,22 +42,24 @@ fn it_preserves_exit_code() {
 
 #[test]
 fn it_connects_and_sends_several_lines() {
-  let (mut server, port_flag) = spawn_test_server();
+  let (mut server, test_flags) = spawn_test_server();
 
   Assert::main_binary()
-    .with_args(&[&*port_flag, "--", "seq", "1", "5"]).unwrap();
+    .with_args(&test_flags)
+    .with_args(&["--", "seq", "1", "5"])
+    .unwrap();
 
   server.kill().unwrap();
   let output = server.wait_with_output().expect("Not able to capture test server output.");
   let output_string = String::from_utf8(output.stdout).unwrap();
-  let output_lines: Vec<&str> = output_string.lines().filter_map(|line| {
+  let output_lines: Vec<String> = output_string.lines().filter_map(|line| {
     if line.starts_with("<") {
-      return Some(line);
+      // Remove the leading syslog elements
+      return Some(line.split(" ").skip(7).collect::<Vec<&str>>().join(" "));
     } else {
       return Option::None;
-    }
-  }).collect();
-  assert_eq!(vec!["this should assert each line"], output_lines);
+    }  }).collect();
+  assert_eq!(vec!["1", "2", "3", "4", "5"], output_lines);
 }
 
 #[test]
@@ -85,7 +88,12 @@ fn it_does_not_crash_on_super_long_lines() {
   assert!(false, "Pending test");
 }
 
-fn spawn_test_server() -> (Child, String) {
+#[test]
+fn it_forwards_signals_to_child() {
+  assert!(false, "Pending test");
+}
+
+fn spawn_test_server() -> (Child, Vec<String>) {
   let listener = TcpListener::bind("localhost:0").expect("Unable to pick a port.");
   let port = listener.local_addr().expect("No local address.").port();
   // TODO: Automatically run minica
@@ -95,5 +103,6 @@ fn spawn_test_server() -> (Child, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("Unable to spawn test-server.sh during test.");
-        return (server_command, format!("localhost:{port}"));
+        return (server_command, vec![format!("localhost:{port}"),
+                                "--add-trusted-certificates".to_string(), "cacert.crt".to_string()]);
 }

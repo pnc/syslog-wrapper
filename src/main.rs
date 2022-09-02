@@ -1,19 +1,18 @@
-use std::borrow::Borrow;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::BufRead;
-use std::io::BufReader;
-use std::io::Write;
-use std::process::exit;
-use std::process::Command;
-use std::process::Stdio;
-use std::sync::mpsc::sync_channel;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio, exit};
+use std::sync::mpsc::channel; // Multiple producer, single consumer channel
 use std::thread;
 
-use clap::Parser;
-use rustls::Certificate;
+use clap::Parser; // Command line parsing
+use rustls::Certificate; // TLS and certificate parsing
+use chrono::Utc; // Formatting UTC time for syslog protocol
 
-// Consider: https://docs.rs/binary-layout/latest/binary_layout/
+const SYSLOG_PRIORITY: &str = "22"; // See RFC 5424 sec. 6.2.1
+const SYSLOG_VERSION: &str = "1"; // See RFC 5424 sec. 6.2.2
+const DEFAULT_SYSLOG_PORT: u16 = 6514;
 
 // https://docs.rs/clap/latest/clap/_derive/_cookbook/escaped_positional/index.html
 // https://docs.rs/retry/latest/retry/
@@ -26,7 +25,6 @@ use rustls::Certificate;
 Test suite items:
 1. Overly long line
 2. Produce only stderr and exit, no stdout
-3. Preserve exit code
 4. Tarpit destination (accept connection but then block writes)
 5. Total throughput benchmark
 6. Invalid cert test
@@ -37,7 +35,6 @@ Test suite items:
 #[clap(author, version, about, long_about = None)]
 struct Args {
     // TODO: Allow URI syntax
-    // TODO: Allow pulling this from environment
     /// Hostname (and optional :port, defaults to 6514) of the remote TCP syslog receiver.
     #[clap(value_parser, env = "SYSLOG_SERVER")]
     server: String,
@@ -53,6 +50,10 @@ struct Args {
     /// Maximum number of times to retry consecutively before crashing
     #[clap(short, long, value_parser, default_value_t = 10)]
     max_retries: u8,
+
+    /// Path to a file containing a PEM-encoded X509 certificate which will be added to the default trust store.
+    #[clap(short, long, value_parser)]
+    add_trusted_certificates: Option<PathBuf>,
 
     /// The actual command to run, and the standard output and standard error
     /// of which will be captured.
@@ -81,7 +82,7 @@ fn main() {
 
     let (host, port): (String, u16) = match args.server.split_once(":") {
         Some((host, port_str)) => (host.into(), port_str.parse().unwrap()),
-        None => (args.server, 6514),
+        None => (args.server, DEFAULT_SYSLOG_PORT),
     };
 
     let command_name = args.command[0].clone();
@@ -102,7 +103,8 @@ fn main() {
     let mut stdout_reader = BufReader::new(child_process.stdout.take().unwrap());
     let mut stderr_reader = BufReader::new(child_process.stderr.take().unwrap());
 
-    let (sender, receiver) = sync_channel(200);
+    // TODO: Consider using sync_channel here with a bound, if we want to apply backpressure to the subprocess.
+    let (sender, receiver) = channel();
 
     let stdout_sender = sender.clone();
     let stdout_handler = thread::spawn(move || loop {
@@ -114,7 +116,7 @@ fn main() {
         // TODO: Possibly have a pass-through/tee mode that also echoes?
         // println!("stdout line is {len} bytes long");
         stdout_sender
-            .try_send(DeliverValue::Line(line))
+            .send(DeliverValue::Line(line))
             .expect("receiver hung up :(");
     });
 
@@ -128,7 +130,7 @@ fn main() {
         // TODO: Possibly have a pass-through/tee mode that also echoes?
         // eprintln!("stderr line is {len} bytes long");
         stderr_sender
-            .try_send(DeliverValue::Line(line))
+            .send(DeliverValue::Line(line))
             .expect("receiver hung up :(");
     });
 
@@ -139,18 +141,24 @@ fn main() {
         });
 
         let mut root_store = rustls::RootCertStore::empty();
-        // TODO: Put this behind a special --add-trusted-certificates flag
 
-        // let cert_file = File::open("server.pem").expect("Could not open server.pem");
-        // let mut cert_file_reader = std::io::BufReader::new(cert_file);
-        // let custom_cert = match rustls_pemfile::read_one(&mut cert_file_reader) {
-        //     Ok(Some(rustls_pemfile::Item::X509Certificate(cert_data))) => cert_data,
-        //     _ => panic!("could not parse"),
-        // };
+        if let Some(trusted_certificates_file) = args.add_trusted_certificates {
+            let cert_file = File::open(trusted_certificates_file.clone())
+                .unwrap_or_else(|e| 
+                    panic!("Could not open trusted certificate file `{trusted_certificates_file:?}`: {e}.")
+                );
+            let mut cert_file_reader = std::io::BufReader::new(cert_file);
+            // TODO: Would be easy to allow multiple certificates here.
+            let custom_cert = match rustls_pemfile::read_one(&mut cert_file_reader) {
+                Ok(Some(rustls_pemfile::Item::X509Certificate(cert_data))) => cert_data,
+                Ok(_) => panic!("The trusted certificate file did not contain a parseable certificate."),
+                Err(e) => panic!("Could not parse trusted certificate: {e}"),
+            };
 
-        // root_store
-        //     .add(&Certificate(custom_cert))
-        //     .expect("could not add trust");
+            root_store
+                .add(&Certificate(custom_cert))
+                .expect("Could not add trusted certificate.");
+        }
 
         root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
             rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
@@ -166,32 +174,37 @@ fn main() {
             .with_no_client_auth();
 
         let arc = std::sync::Arc::new(config);
-        //let dns_name = webpki::DnsNameRef::try_from_ascii_str("localhost").unwrap();
-        let example_com = host.as_str().try_into().unwrap();
-        let mut client = rustls::ClientConnection::new(arc, example_com).unwrap();
-        let mut stream = rustls::Stream::new(&mut client, &mut socket); // Create stream
-                                                                        // Instead of writing to the client, you write to the stream
+        let server_name = host.as_str().try_into().unwrap();
+        let mut client = rustls::ClientConnection::new(arc, server_name).unwrap();
+        let mut stream = rustls::Stream::new(&mut client, &mut socket);
 
         let hostname = args.hostname.expect("The command line parser failed.");
         let appname = args.appname.expect("The command line parser failed.");
         loop {
-            let result1 = receiver.recv().unwrap();
-            match result1 {
+            let result = receiver.recv().unwrap();
+            match result {
                 DeliverValue::Eof() => break,
                 DeliverValue::Line(str) => {
                     // TODO: Enforce newline?
                     // TODO: What if appname contains space?
-                    let formatted = format!("<165>1 2003-08-24T05:14:15.000003-07:00 {hostname} {appname} 8710 - - {str}");
+                    // TODO: Produce timestamp on sending thread in case this one is behind during a retry?
+                    // Timestamp format per https://www.rfc-editor.org/rfc/rfc5424#section-6
+                    // E.g: 2003-08-24T05:14:15.000003-07:00
+                    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z");
+                    let formatted = format!("<{SYSLOG_PRIORITY}>{SYSLOG_VERSION} {timestamp} {hostname} {appname} - - - {str}");
                     stream.write(formatted.as_bytes()).unwrap();
                 },
             };
         }
     });
 
+    // Wait for the threads to finish consuming the child process's output
     stderr_handler.join().unwrap();
     stdout_handler.join().unwrap();
-    sender.send(DeliverValue::Eof()).expect("oh no");
+    sender.send(DeliverValue::Eof()).expect("Unable to send EOF to consuming threads.");
+    // Wait for delivery of remaining messages to flush
     delivery.join().unwrap();
+    // Wait for the child to exit
     match child_process.wait() {
         Ok(status) => match status.code() {
             // Preserve the exit code of the child

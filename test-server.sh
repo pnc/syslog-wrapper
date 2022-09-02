@@ -2,4 +2,6 @@
 
 set -e
 
-exec openssl s_server -accept $1
+[ ! -f "localhost.crt" ] && minica localhost
+
+exec openssl s_server -cert localhost.crt -key localhost.key -accept $1
