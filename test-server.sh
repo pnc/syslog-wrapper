@@ -2,4 +2,4 @@
 
 set -e
 
-exec openssl s_server -accept 8443
+exec openssl s_server -accept $1

@@ -35,9 +35,11 @@ Test suite items:
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// Name of the person to greet
-    #[clap(short, long, value_parser, default_value = "adsf")]
-    name: String,
+    // TODO: Allow URI syntax
+    // TODO: Allow pulling this from environment
+    /// Hostname (and optional :port, defaults to 6514) of the remote TCP syslog receiver.
+    #[clap(value_parser, env = "SYSLOG_SERVER")]
+    server: String,
 
     /// Maximum number of times to retry consecutively before crashing
     #[clap(short, long, value_parser, default_value_t = 10)]
@@ -57,6 +59,11 @@ enum DeliverValue {
 
 fn main() {
     let args = Args::parse();
+
+    let (host, port): (String, u16) = match args.server.split_once(":") {
+        Some((host, port_str)) => (host.into(), port_str.parse().unwrap()),
+        None => (args.server, 6514),
+    };
 
     let command_name = args.command[0].clone();
     let spawn_result = Command::new(command_name.clone())
@@ -105,7 +112,10 @@ fn main() {
     });
 
     let delivery = thread::spawn(move || {
-        let mut socket = std::net::TcpStream::connect("localhost:8443").unwrap();
+        let mut socket = std::net::TcpStream::connect((host.clone(), port)).unwrap_or_else(|e| {
+            eprintln!("Unable to connect to `{host}:{port}`: {e}");
+            exit(127);
+        });
 
         let mut root_store = rustls::RootCertStore::empty();
 
@@ -134,7 +144,7 @@ fn main() {
 
         let arc = std::sync::Arc::new(config);
         //let dns_name = webpki::DnsNameRef::try_from_ascii_str("localhost").unwrap();
-        let example_com = "localhost".try_into().unwrap();
+        let example_com = host.as_str().try_into().unwrap();
         let mut client = rustls::ClientConnection::new(arc, example_com).unwrap();
         let mut stream = rustls::Stream::new(&mut client, &mut socket); // Create stream
                                                                         // Instead of writing to the client, you write to the stream
@@ -143,7 +153,11 @@ fn main() {
             let result1 = receiver.recv().unwrap();
             match result1 {
                 DeliverValue::Eof() => break,
-                DeliverValue::Line(str) => stream.write(str.as_bytes()).unwrap(),
+                DeliverValue::Line(str) => {
+                    // TODO: Enforce newline?
+                    let formatted = format!("<165>1 2003-08-24T05:14:15.000003-07:00 192.0.2.1 myproc 8710 - - {str}");
+                    stream.write(formatted.as_bytes()).unwrap();
+                },
             };
         }
     });
