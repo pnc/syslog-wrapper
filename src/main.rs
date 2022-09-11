@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio, exit};
 use std::sync::mpsc::channel; // Multiple producer, single consumer channel
@@ -8,10 +8,9 @@ use std::thread;
 
 use clap::Parser; // Command line parsing
 use rustls::Certificate; // TLS and certificate parsing
-use chrono::Utc; // Formatting UTC time for syslog protocol
 
-const SYSLOG_PRIORITY: &str = "22"; // See RFC 5424 sec. 6.2.1
-const SYSLOG_VERSION: &str = "1"; // See RFC 5424 sec. 6.2.2
+mod sender;
+
 const DEFAULT_SYSLOG_PORT: u16 = 6514;
 
 // https://docs.rs/clap/latest/clap/_derive/_cookbook/escaped_positional/index.html
@@ -55,8 +54,8 @@ struct Args {
     #[clap(short, long, value_parser)]
     add_trusted_certificates: Option<PathBuf>,
 
-    /// The actual command to run, and the standard output and standard error
-    /// of which will be captured.
+    /// The actual command to run. This command's standard output and standard error
+    /// will be captured and forwarded to `server`.
     #[clap(last = true, value_parser, required = true)]
     command: Vec<OsString>,
 }
@@ -134,76 +133,48 @@ fn main() {
             .expect("receiver hung up :(");
     });
 
-    let delivery = thread::spawn(move || {
-        let mut socket = std::net::TcpStream::connect((host.clone(), port)).unwrap_or_else(|e| {
-            eprintln!("Unable to connect to `{host}:{port}`: {e}");
-            exit(127);
-        });
+    ////
+    let mut root_store = rustls::RootCertStore::empty();
 
-        let mut root_store = rustls::RootCertStore::empty();
+    if let Some(trusted_certificates_file) = args.add_trusted_certificates {
+        let cert_file = File::open(trusted_certificates_file.clone())
+            .unwrap_or_else(|e|
+                panic!("Could not open trusted certificate file `{trusted_certificates_file:?}`: {e}.")
+            );
+        let mut cert_file_reader = std::io::BufReader::new(cert_file);
+        // TODO: Would be easy to allow multiple certificates here.
+        let custom_cert = match rustls_pemfile::read_one(&mut cert_file_reader) {
+            Ok(Some(rustls_pemfile::Item::X509Certificate(cert_data))) => cert_data,
+            Ok(_) => panic!("The trusted certificate file did not contain a parseable certificate."),
+            Err(e) => panic!("Could not parse trusted certificate: {e}"),
+        };
 
-        if let Some(trusted_certificates_file) = args.add_trusted_certificates {
-            let cert_file = File::open(trusted_certificates_file.clone())
-                .unwrap_or_else(|e| 
-                    panic!("Could not open trusted certificate file `{trusted_certificates_file:?}`: {e}.")
-                );
-            let mut cert_file_reader = std::io::BufReader::new(cert_file);
-            // TODO: Would be easy to allow multiple certificates here.
-            let custom_cert = match rustls_pemfile::read_one(&mut cert_file_reader) {
-                Ok(Some(rustls_pemfile::Item::X509Certificate(cert_data))) => cert_data,
-                Ok(_) => panic!("The trusted certificate file did not contain a parseable certificate."),
-                Err(e) => panic!("Could not parse trusted certificate: {e}"),
-            };
+        root_store
+            .add(&Certificate(custom_cert))
+            .expect("Could not add trusted certificate.");
+    }
 
-            root_store
-                .add(&Certificate(custom_cert))
-                .expect("Could not add trusted certificate.");
-        }
+    root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+            ta.subject,
+            ta.spki,
+            ta.name_constraints,
+        )
+    }));
+    /////
 
-        root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject,
-                ta.spki,
-                ta.name_constraints,
-            )
-        }));
+    let hostname = args.hostname.expect("The command line parser failed.");
+    let appname = args.appname.expect("The command line parser failed.");
 
-        let config = rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        let arc = std::sync::Arc::new(config);
-        let server_name = host.as_str().try_into().unwrap();
-        let mut client = rustls::ClientConnection::new(arc, server_name).unwrap();
-        let mut stream = rustls::Stream::new(&mut client, &mut socket);
-
-        let hostname = args.hostname.expect("The command line parser failed.");
-        let appname = args.appname.expect("The command line parser failed.");
-        loop {
-            let result = receiver.recv().unwrap();
-            match result {
-                DeliverValue::Eof() => break,
-                DeliverValue::Line(str) => {
-                    // TODO: Enforce newline?
-                    // TODO: What if appname contains space?
-                    // TODO: Produce timestamp on sending thread in case this one is behind during a retry?
-                    // Timestamp format per https://www.rfc-editor.org/rfc/rfc5424#section-6
-                    // E.g: 2003-08-24T05:14:15.000003-07:00
-                    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z");
-                    let formatted = format!("<{SYSLOG_PRIORITY}>{SYSLOG_VERSION} {timestamp} {hostname} {appname} - - - {str}");
-                    stream.write(formatted.as_bytes()).unwrap();
-                },
-            };
-        }
-    });
+    let delivery_result = sender::Sender::new(root_store, host, port, hostname, appname);
+    let delivery = delivery_result.start(receiver);
 
     // Wait for the threads to finish consuming the child process's output
     stderr_handler.join().unwrap();
     stdout_handler.join().unwrap();
     sender.send(DeliverValue::Eof()).expect("Unable to send EOF to consuming threads.");
     // Wait for delivery of remaining messages to flush
-    delivery.join().unwrap();
+    delivery.join().unwrap().expect("Unable to connect");
     // Wait for the child to exit
     match child_process.wait() {
         Ok(status) => match status.code() {
