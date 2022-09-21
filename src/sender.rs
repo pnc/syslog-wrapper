@@ -75,6 +75,7 @@ impl Sender {
 //    let root_store = self.root_store;
 
     return thread::spawn(move || {
+      // TODO: Allow max retries to be configured via command line
       return retry(Exponential::from_millis(10).take(3), move || {
         let mut socket = std::net::TcpStream::connect((host.clone(), port))?;
 
@@ -83,6 +84,7 @@ impl Sender {
         let mut client = rustls::ClientConnection::new(arc, server_name.clone())?;
         let mut stream = rustls::Stream::new(&mut client, &mut socket);
         loop {
+          // TODO: Flip this so we don't consume a value per retry
             let result = receiver.recv()?;
             match result {
                 DeliverValue::Eof() => break,

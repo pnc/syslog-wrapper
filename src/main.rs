@@ -15,6 +15,7 @@ const DEFAULT_SYSLOG_PORT: u16 = 6514;
 
 // https://docs.rs/clap/latest/clap/_derive/_cookbook/escaped_positional/index.html
 // https://docs.rs/retry/latest/retry/
+// https://rust-cli.github.io/book/in-depth/signals.html
 // https://www.rfc-editor.org/rfc/rfc3164#section-4.1
 // https://www.rfc-editor.org/rfc/rfc5425#section-4.3
 // https://www.rfc-editor.org/rfc/rfc5424#section-6
