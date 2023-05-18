@@ -29,6 +29,19 @@ fn it_fails_to_connect() {
 }
 
 #[test]
+fn it_fails_if_certificate_is_not_trusted() {
+  let (mut server, test_flags) = spawn_test_server();
+
+  Assert::main_binary()
+    .with_args(&[test_flags[0].clone()])
+    .with_args(&["--", "ls"])
+      .fails_with(127).and()
+      .stderr().contains("Unable to connect").unwrap();
+
+  server.kill().unwrap();
+}
+
+#[test]
 fn it_preserves_exit_code() {
   let (mut server, test_flags) = spawn_test_server();
 
@@ -75,11 +88,6 @@ fn it_honors_hostname_flag() {
 
 #[test]
 fn it_honors_process_name_flag() {
-  assert!(false, "Pending test");
-}
-
-#[test]
-fn it_fails_if_certificate_is_not_trusted() {
   assert!(false, "Pending test");
 }
 
