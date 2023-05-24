@@ -2,6 +2,7 @@ extern crate assert_cli;
 use assert_cli::Assert;
 
 use std::net::TcpListener;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio, Child};
 
 
@@ -42,16 +43,30 @@ fn it_preserves_exit_code() {
 
 #[test]
 fn it_connects_and_sends_several_lines() {
-  let (mut server, test_flags) = spawn_test_server();
+  let (server, test_flags) = spawn_test_server();
 
-  Assert::main_binary()
+  let main = Assert::main_binary()
     .with_args(&test_flags)
-    .with_args(&["--", "seq", "1", "5"])
-    .unwrap();
+    .with_args(&["--", "seq", "1", "5"]);
 
-  server.kill().unwrap();
+  let main_result = main.execute();
+
+  let server_pid = server.id().to_string();
+
+  let mut kill = Command::new("kill")
+      .args(["-s", "TERM", &server_pid])
+      .spawn().expect("Unable to sigterm server.");
+  kill.wait().expect("Unable to sigterm.");
+
   let output = server.wait_with_output().expect("Not able to capture test server output.");
   let output_string = String::from_utf8(output.stdout).unwrap();
+  let error_string = String::from_utf8(output.stderr).unwrap();
+
+  assert!(main_result.is_ok(),
+    "Test server failed: server_exit={:?} client_exit={} {} {}",
+    output.status.signal(), main_result.unwrap_err(),
+    output_string, error_string);
+
   let output_lines: Vec<String> = output_string.lines().filter_map(|line| {
     if line.starts_with("<") {
       // Remove the leading syslog elements
